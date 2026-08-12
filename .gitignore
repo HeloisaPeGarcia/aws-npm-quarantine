@@ -1,0 +1,14 @@
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+!*.tfvars.example
+lambda/promote_package.zip
+lambda/__pycache__/
+lambda/*.pyc
+lambda/.pytest_cache/
+lambda/.coverage
+.npmrc
+.env
+*.log

@@ -1,0 +1,36 @@
+# Copie para terraform.tfvars e ajuste os valores.
+# NUNCA commite terraform.tfvars com credenciais reais.
+
+# ── Geral ──────────────────────────────────────────────────────────────────────
+domain_name  = "minha-empresa"
+environment  = "dev"
+aws_region   = "us-east-1"
+
+# ── Quarentena ─────────────────────────────────────────────────────────────────
+quarantine_days = 5
+
+# ── Alertas ────────────────────────────────────────────────────────────────────
+notification_email = ""  # ex: "security-team@empresa.com"
+
+# ── OSV.dev Scanner ────────────────────────────────────────────────────────────
+osv_enabled     = true
+osv_fail_open   = false  # NUNCA altere para true em produção
+osv_timeout_seconds = 10
+osv_max_retries = 3
+
+# ── CloudWatch Métricas ────────────────────────────────────────────────────────
+custom_metrics_enabled = true
+
+# ── Lambda ─────────────────────────────────────────────────────────────────────
+lambda_schedule_rate = "rate(6 hours)"
+lambda_timeout       = 300
+lambda_memory        = 256
+log_retention_days   = 30
+
+# ── VPC (recomendado para produção) ────────────────────────────────────────────
+create_vpc = false  # altere para true em staging/prod
+
+# Preencha apenas se create_vpc = true:
+# vpc_cidr             = "10.0.0.0/16"
+# private_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
+# public_subnet_cidrs  = ["10.0.101.0/24", "10.0.102.0/24"]

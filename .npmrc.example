@@ -1,0 +1,19 @@
+# Copiar este arquivo para .npmrc no projeto npm após autenticar.
+#
+# Autenticação (renovar a cada 12h ou via CI/CD):
+#   aws codeartifact login --tool npm \
+#     --domain minha-empresa \
+#     --domain-owner <AWS_ACCOUNT_ID> \
+#     --repository npm-store \
+#     --region us-east-1
+#
+# O comando acima preenche automaticamente o .npmrc com o token correto.
+# Substitua <AWS_ACCOUNT_ID> pelo ID da sua conta AWS.
+#
+# Também pode obter o endpoint via terraform output:
+#   cd infra && terraform output -raw store_repo_endpoint
+#
+# ── Configuração manual (substitua os valores) ─────────────────────────────────
+registry=https://minha-empresa-<AWS_ACCOUNT_ID>.d.codeartifact.us-east-1.amazonaws.com/npm/npm-store/
+//minha-empresa-<AWS_ACCOUNT_ID>.d.codeartifact.us-east-1.amazonaws.com/npm/npm-store/:always-auth=true
+//minha-empresa-<AWS_ACCOUNT_ID>.d.codeartifact.us-east-1.amazonaws.com/npm/npm-store/:_authToken=${CODEARTIFACT_AUTH_TOKEN}
