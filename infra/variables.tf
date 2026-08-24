@@ -82,7 +82,6 @@ variable "log_retention_days" {
   }
 }
 
-# ── OSV.dev scanner ───────────────────────────────────────────────────────────
 variable "osv_enabled" {
   description = "Habilitar scan de vulnerabilidades via OSV.dev (osv.dev — Google, gratuito)"
   type        = bool
@@ -118,7 +117,12 @@ variable "custom_metrics_enabled" {
   default     = true
 }
 
-# ── VPC (recomendado para produção) ───────────────────────────────────────────
+variable "max_workers" {
+  description = "Número máximo de requisições concorrentes (threads) para o scanner e CodeArtifact"
+  type        = number
+  default     = 10
+}
+
 variable "create_vpc" {
   description = <<-EOT
     Criar VPC dedicada com subnets privadas e NAT Gateway para a Lambda.
