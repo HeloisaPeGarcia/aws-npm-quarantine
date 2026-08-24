@@ -1,4 +1,3 @@
-# Empacota o código Python automaticamente antes de criar/atualizar a Lambda
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda"
@@ -6,7 +5,6 @@ data "archive_file" "lambda_zip" {
   output_path = "${path.module}/../lambda/promote_package.zip"
 }
 
-# ── Lambda Function ────────────────────────────────────────────────────────────
 resource "aws_lambda_function" "promote_package" {
   function_name    = "promote-quarantined-packages-${var.environment}"
   runtime          = "python3.12"
@@ -26,13 +24,12 @@ resource "aws_lambda_function" "promote_package" {
       SNS_TOPIC_ARN           = aws_sns_topic.quarantine_alerts.arn
       ENVIRONMENT             = var.environment
       AWS_ACCOUNT_ID          = local.account_id
-      # OSV.dev scanner
       OSV_ENABLED             = tostring(var.osv_enabled)
       OSV_FAIL_OPEN           = tostring(var.osv_fail_open)
       OSV_TIMEOUT             = tostring(var.osv_timeout_seconds)
       OSV_MAX_RETRIES         = tostring(var.osv_max_retries)
-      # Métricas customizadas
       CUSTOM_METRICS_ENABLED  = tostring(var.custom_metrics_enabled)
+      MAX_WORKERS             = tostring(var.max_workers)
     }
   }
 
@@ -41,10 +38,9 @@ resource "aws_lambda_function" "promote_package" {
   }
 
   tracing_config {
-    mode = "Active"  # X-Ray
+    mode = "Active"
   }
 
-  # VPC config — habilitado somente quando create_vpc=true
   dynamic "vpc_config" {
     for_each = var.create_vpc ? [1] : []
     content {
@@ -59,10 +55,9 @@ resource "aws_lambda_function" "promote_package" {
   ]
 }
 
-# ── Dead Letter Queue (com KMS) ────────────────────────────────────────────────
 resource "aws_sqs_queue" "lambda_dlq" {
   name                      = "npm-quarantine-dlq-${var.environment}"
-  message_retention_seconds = 1209600  # 14 dias
+  message_retention_seconds = 1209600
   kms_master_key_id         = aws_kms_key.quarantine.arn
 }
 
@@ -85,14 +80,12 @@ resource "aws_sqs_queue_policy" "lambda_dlq" {
   })
 }
 
-# ── CloudWatch Logs (com KMS) ──────────────────────────────────────────────────
 resource "aws_cloudwatch_log_group" "lambda_logs" {
   name              = "/aws/lambda/promote-quarantined-packages-${var.environment}"
   retention_in_days = var.log_retention_days
   kms_key_id        = aws_kms_key.quarantine.arn
 }
 
-# ── CloudWatch Alarms ──────────────────────────────────────────────────────────
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   alarm_name          = "npm-quarantine-lambda-errors-${var.environment}"
   comparison_operator = "GreaterThanThreshold"
@@ -102,7 +95,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   period              = 300
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "Lambda de promoção de pacotes falhou"
+  alarm_description   = "Lambda falhou"
   treat_missing_data  = "notBreaching"
 
   dimensions = { FunctionName = aws_lambda_function.promote_package.function_name }
@@ -120,14 +113,13 @@ resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
   period              = 300
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "DLQ não vazia: Lambda falhou repetidamente"
+  alarm_description   = "DLQ nao vazia"
   treat_missing_data  = "notBreaching"
 
   dimensions     = { QueueName = aws_sqs_queue.lambda_dlq.name }
   alarm_actions  = [aws_sns_topic.quarantine_alerts.arn]
 }
 
-# Alarme: OSV indisponível (falha no scanner)
 resource "aws_cloudwatch_metric_alarm" "osv_unavailable" {
   alarm_name          = "npm-quarantine-osv-unavailable-${var.environment}"
   comparison_operator = "GreaterThanThreshold"
@@ -137,20 +129,17 @@ resource "aws_cloudwatch_metric_alarm" "osv_unavailable" {
   period              = 3600
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "Scanner OSV.dev indisponível — promoções podem estar bloqueadas (fail-closed)"
+  alarm_description   = "Scanner indisponivel"
   treat_missing_data  = "notBreaching"
 
   dimensions    = { Environment = var.environment }
   alarm_actions = [aws_sns_topic.quarantine_alerts.arn]
 }
 
-# ── IAM Role ───────────────────────────────────────────────────────────────────
 resource "aws_iam_role" "lambda_role" {
   name        = "npm-quarantine-lambda-role-${var.environment}"
-  description = "Role da Lambda npm-quarantine: promove/bloqueia pacotes"
+  description = "Role da Lambda npm-quarantine"
 
-  # Trust policy: apenas o serviço Lambda pode assumir esta role
-  # Isso previne que usuários humanos façam assume-role direto
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -162,12 +151,10 @@ resource "aws_iam_role" "lambda_role" {
   })
 
   tags = {
-    # Tag usada como condição no DenyDirectDevPublish do CodeArtifact
     QuarantineAutomation = "true"
   }
 }
 
-# CodeArtifact — least-privilege por ações específicas em recursos específicos
 resource "aws_iam_role_policy" "lambda_codeartifact" {
   name = "codeartifact-access"
   role = aws_iam_role.lambda_role.id
@@ -220,7 +207,6 @@ resource "aws_iam_role_policy" "lambda_codeartifact" {
   })
 }
 
-# SNS — apenas Publish no tópico específico
 resource "aws_iam_role_policy" "lambda_sns" {
   name = "sns-publish"
   role = aws_iam_role.lambda_role.id
@@ -236,7 +222,6 @@ resource "aws_iam_role_policy" "lambda_sns" {
   })
 }
 
-# SQS — apenas SendMessage na DLQ específica
 resource "aws_iam_role_policy" "lambda_sqs" {
   name = "sqs-dlq"
   role = aws_iam_role.lambda_role.id
@@ -252,7 +237,6 @@ resource "aws_iam_role_policy" "lambda_sqs" {
   })
 }
 
-# CloudWatch — PutMetricData apenas no namespace NPMQuarantine
 resource "aws_iam_role_policy" "lambda_cloudwatch" {
   name = "cloudwatch-metrics"
   role = aws_iam_role.lambda_role.id
@@ -273,7 +257,6 @@ resource "aws_iam_role_policy" "lambda_cloudwatch" {
   })
 }
 
-# X-Ray tracing
 resource "aws_iam_role_policy" "lambda_xray" {
   name = "xray-tracing"
   role = aws_iam_role.lambda_role.id
@@ -292,7 +275,6 @@ resource "aws_iam_role_policy" "lambda_xray" {
   })
 }
 
-# KMS — usar a chave para DLQ e CloudWatch Logs
 resource "aws_iam_role_policy" "lambda_kms" {
   name = "kms-usage"
   role = aws_iam_role.lambda_role.id
@@ -312,7 +294,6 @@ resource "aws_iam_role_policy" "lambda_kms" {
   })
 }
 
-# VPC — necessário para Lambda em subnet privada
 resource "aws_iam_role_policy" "lambda_vpc" {
   count = var.create_vpc ? 1 : 0
   name  = "vpc-access"
@@ -340,7 +321,6 @@ resource "aws_iam_role_policy" "lambda_vpc" {
   })
 }
 
-# CloudWatch Logs básico (create log streams/events)
 resource "aws_iam_role_policy_attachment" "lambda_logs" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"

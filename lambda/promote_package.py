@@ -1,6 +1,6 @@
-
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import json
 import logging
@@ -14,13 +14,10 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
 def _log(level: str, event: str, **kwargs: Any) -> None:
-    """Emite log em JSON estruturado — queryável via CloudWatch Insights."""
     record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "level": level.upper(),
@@ -30,13 +27,10 @@ def _log(level: str, event: str, **kwargs: Any) -> None:
     }
     getattr(logger, level)(json.dumps(record, default=str))
 
-
-# ── Clientes AWS ──────────────────────────────────────────────────────────────
 codeartifact = boto3.client("codeartifact")
 sns_client = boto3.client("sns")
 cloudwatch = boto3.client("cloudwatch")
 
-# ── Config ────────────────────────────────────────────────────────────────────
 DOMAIN = os.environ["DOMAIN"]
 SOURCE_REPO = os.environ["SOURCE_REPO"]
 DEST_REPO = os.environ["DEST_REPO"]
@@ -45,17 +39,14 @@ SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "")
 
-# ── Config do scanner OSV.dev ─────────────────────────────────────────────────
 OSV_ENABLED = os.environ.get("OSV_ENABLED", "true").lower() == "true"
-# IMPORTANTE: fail-closed é o padrão seguro.
-# Se OSV_FAIL_OPEN=false e o scanner falhar → pacote NÃO é promovido.
-# Só defina OSV_FAIL_OPEN=true se entender e aceitar o risco de promoção sem scan.
 OSV_FAIL_OPEN = os.environ.get("OSV_FAIL_OPEN", "false").lower() == "true"
 OSV_TIMEOUT = int(os.environ.get("OSV_TIMEOUT", "10"))
 OSV_MAX_RETRIES = int(os.environ.get("OSV_MAX_RETRIES", "3"))
 CUSTOM_METRICS_ENABLED = os.environ.get("CUSTOM_METRICS_ENABLED", "true").lower() == "true"
 
 OSV_API_URL = "https://api.osv.dev/v1/query"
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "10"))
 
 
 @dataclass
@@ -79,10 +70,7 @@ class PackageResult:
             },
         }
 
-
-# ── Paginação genérica ─────────────────────────────────────────────────────────
 def paginate(method: Any, result_key: str, **kwargs: Any) -> list[dict]:
-    """Itera sobre todas as páginas de uma API CodeArtifact automaticamente."""
     items: list[dict] = []
     next_token: str | None = None
     while True:
@@ -95,10 +83,7 @@ def paginate(method: Any, result_key: str, **kwargs: Any) -> list[dict]:
             break
     return items
 
-
-# ── Métricas customizadas ─────────────────────────────────────────────────────
 def emit_metric(name: str, value: float, unit: str = "Count") -> None:
-    """Emite métrica no namespace NPMQuarantine do CloudWatch."""
     if not CUSTOM_METRICS_ENABLED:
         return
     try:
@@ -114,24 +99,7 @@ def emit_metric(name: str, value: float, unit: str = "Count") -> None:
     except Exception as exc:  # noqa: BLE001
         _log("warning", "metric_emit_failed", metric=name, error=str(exc))
 
-
-# ── OSV.dev — verificação real de vulnerabilidades ───────────────────────────
 def check_osv_vulnerabilities(package_name: str, version: str) -> tuple[bool, list[str]]:
-    """
-    Consulta a API osv.dev por vulnerabilidades do pacote npm.
-
-    OSV (Open Source Vulnerabilities) é mantido pelo Google Security Team,
-    gratuito, sem necessidade de API key, e atualizado diariamente com dados
-    do GitHub Advisory Database, NVD/CVE, e outras fontes.
-
-    Comportamento em falha (todos os retries esgotados):
-      OSV_FAIL_OPEN=false (padrão) → retorna (True, ["OSV_UNAVAILABLE"])
-        → pacote tratado como vulnerável → NÃO é promovido (FAIL-CLOSED)
-      OSV_FAIL_OPEN=true            → retorna (False, []) → promove sem scan
-
-    Returns:
-      (has_vulnerability, vuln_ids): tuple com bool e lista de IDs (CVE/GHSA/etc)
-    """
     if not OSV_ENABLED:
         return False, []
 
@@ -144,7 +112,7 @@ def check_osv_vulnerabilities(package_name: str, version: str) -> tuple[bool, li
 
     for attempt in range(OSV_MAX_RETRIES):
         if attempt > 0:
-            backoff = 2 ** attempt  # 2s, 4s, ...
+            backoff = 2 ** attempt
             _log("info", "osv_retry",
                  package=package_name, version=version,
                  attempt=attempt, backoff_seconds=backoff)
@@ -183,7 +151,6 @@ def check_osv_vulnerabilities(package_name: str, version: str) -> tuple[bool, li
                  attempt=attempt + 1, max_retries=OSV_MAX_RETRIES,
                  error=str(exc))
 
-    # ── Todos os retries esgotados ────────────────────────────────────────────
     emit_metric("OSVUnavailableCount", 1)
 
     if not OSV_FAIL_OPEN:
@@ -191,8 +158,7 @@ def check_osv_vulnerabilities(package_name: str, version: str) -> tuple[bool, li
              package=package_name, version=version,
              error=str(last_error),
              action="blocking_promotion_by_policy",
-             remediation="Verifique conectividade de rede e tente novamente. "
-                         "Para bypass temporário (NÃO recomendado): OSV_FAIL_OPEN=true")
+             remediation="Verifique conectividade de rede e tente novamente.")
         return True, ["OSV_UNAVAILABLE"]
 
     _log("error", "osv_fail_open_override",
@@ -200,13 +166,7 @@ def check_osv_vulnerabilities(package_name: str, version: str) -> tuple[bool, li
          warning="RISCO: pacote promovido sem verificação de CVE")
     return False, []
 
-
-# ── Idempotência ──────────────────────────────────────────────────────────────
 def get_versions_in_dest(package_name: str, namespace: str) -> set[str]:
-    """
-    Retorna conjunto de versões já presentes no DEST_REPO.
-    Garante idempotência: versões já promovidas são ignoradas em re-execuções.
-    """
     kwargs: dict[str, Any] = {
         "domain": DOMAIN,
         "repository": DEST_REPO,
@@ -221,13 +181,10 @@ def get_versions_in_dest(package_name: str, namespace: str) -> set[str]:
         return {v["version"] for v in versions}
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "ResourceNotFoundException":
-            return set()  # pacote ainda não existe no destino
+            return set()
         raise
 
-
-# ── Bloqueio ──────────────────────────────────────────────────────────────────
 def block_package(package_name: str, version: str, namespace: str, vuln_ids: list[str]) -> None:
-    """Bloqueia publicação e upstream do pacote no repositório de quarentena."""
     kwargs: dict[str, Any] = {
         "domain": DOMAIN,
         "repository": SOURCE_REPO,
@@ -244,10 +201,7 @@ def block_package(package_name: str, version: str, namespace: str, vuln_ids: lis
          namespace=namespace or None, vuln_ids=vuln_ids,
          action="put_package_origin_configuration_block")
 
-
-# ── Promoção ──────────────────────────────────────────────────────────────────
 def promote_package_version(package_name: str, version: str, namespace: str) -> None:
-    """Copia o pacote da quarentena para o repositório de produção."""
     kwargs: dict[str, Any] = {
         "domain": DOMAIN,
         "sourceRepository": SOURCE_REPO,
@@ -266,10 +220,7 @@ def promote_package_version(package_name: str, version: str, namespace: str) -> 
          namespace=namespace or None,
          source=SOURCE_REPO, destination=DEST_REPO)
 
-
-# ── Alerta SNS ────────────────────────────────────────────────────────────────
 def send_block_alert(blocked_packages: list[dict]) -> None:
-    """Publica alerta SNS agregado (uma mensagem por execução, não por pacote)."""
     if not blocked_packages:
         return
 
@@ -294,8 +245,6 @@ def send_block_alert(blocked_packages: list[dict]) -> None:
     )
     _log("info", "block_alert_sent", blocked_count=len(blocked_packages))
 
-
-# ── Handler ───────────────────────────────────────────────────────────────────
 def handler(event: dict, context: Any) -> dict:
     start_time = time.monotonic()
     _log("info", "execution_started",
@@ -306,7 +255,6 @@ def handler(event: dict, context: Any) -> dict:
     result = PackageResult()
     blocked_details: list[dict] = []
 
-    # ── 1. Lista todos os pacotes na quarentena ───────────────────────────────
     try:
         packages = paginate(
             codeartifact.list_packages,
@@ -322,6 +270,8 @@ def handler(event: dict, context: Any) -> dict:
     _log("info", "packages_discovered", total=len(packages))
     emit_metric("QuarantineQueueDepth", len(packages))
     now = datetime.datetime.now(datetime.timezone.utc)
+
+    tasks = []
 
     for pkg in packages:
         package_name: str = pkg["package"]
@@ -344,7 +294,6 @@ def handler(event: dict, context: Any) -> dict:
             result.errors.append(f"{package_name}: {exc}")
             continue
 
-        # ── 2. Idempotência: descobre versões já promovidas ───────────────────
         try:
             already_in_dest = get_versions_in_dest(package_name, namespace)
             if already_in_dest:
@@ -361,72 +310,92 @@ def handler(event: dict, context: Any) -> dict:
             ns_prefix = f"@{namespace}/" if namespace else ""
             pkg_ref = f"{ns_prefix}{package_name}@{version}"
 
-            # ── Idempotência ──────────────────────────────────────────────────
             if version in already_in_dest:
                 _log("debug", "skipping_already_promoted", package_ref=pkg_ref)
                 continue
+            
+            tasks.append((package_name, version, namespace, pkg_ref))
 
+    def process_package_version(package_name: str, version: str, namespace: str, pkg_ref: str) -> tuple[str, dict | None, str | None]:
+        try:
+            details = codeartifact.describe_package_version(
+                domain=DOMAIN,
+                repository=SOURCE_REPO,
+                format="npm",
+                package=package_name,
+                packageVersion=version,
+                **({"namespace": namespace} if namespace else {}),
+            )["packageVersion"]
+
+            published_at: datetime.datetime | None = details.get("publishedTime")
+            if not published_at:
+                _log("warning", "published_time_missing", package_ref=pkg_ref)
+                return "skipped", None, None
+
+            age_days = (now - published_at).days
+
+            if age_days < QUARANTINE_DAYS:
+                _log("info", "quarantine_active",
+                     package_ref=pkg_ref, age_days=age_days,
+                     required_days=QUARANTINE_DAYS,
+                     remaining_days=QUARANTINE_DAYS - age_days)
+                return "skipped", None, None
+
+            has_vuln, vuln_ids = check_osv_vulnerabilities(package_name, version)
+
+            if has_vuln:
+                block_package(package_name, version, namespace, vuln_ids)
+                return "blocked", {
+                    "package": package_name,
+                    "version": version,
+                    "vuln_ids": vuln_ids,
+                }, None
+            else:
+                promote_package_version(package_name, version, namespace)
+                return "promoted", None, None
+
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code == "ResourceNotFoundException":
+                _log("warning", "package_not_found", package_ref=pkg_ref)
+                return "skipped", None, None
+            else:
+                _log("error", "package_processing_error",
+                     package_ref=pkg_ref, error_code=code, error=str(exc))
+                return "error", None, f"{pkg_ref}: {exc}"
+
+    _log("info", "starting_parallel_validation", tasks_count=len(tasks), max_workers=MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_pkg = {executor.submit(process_package_version, *t): t for t in tasks}
+        
+        for future in concurrent.futures.as_completed(future_to_pkg):
+            t = future_to_pkg[future]
+            pkg_ref = t[3]
             try:
-                details = codeartifact.describe_package_version(
-                    domain=DOMAIN,
-                    repository=SOURCE_REPO,
-                    format="npm",
-                    package=package_name,
-                    packageVersion=version,
-                    **({"namespace": namespace} if namespace else {}),
-                )["packageVersion"]
-
-                published_at: datetime.datetime | None = details.get("publishedTime")
-                if not published_at:
-                    _log("warning", "published_time_missing", package_ref=pkg_ref)
-                    continue
-
-                age_days = (now - published_at).days
-
-                # ── Quarentena ainda ativa ────────────────────────────────────
-                if age_days < QUARANTINE_DAYS:
-                    _log("info", "quarantine_active",
-                         package_ref=pkg_ref, age_days=age_days,
-                         required_days=QUARANTINE_DAYS,
-                         remaining_days=QUARANTINE_DAYS - age_days)
-                    result.skipped.append(pkg_ref)
-                    continue
-
-                # ── Scan de vulnerabilidade (OSV.dev) ─────────────────────────
-                has_vuln, vuln_ids = check_osv_vulnerabilities(package_name, version)
-
-                if has_vuln:
-                    block_package(package_name, version, namespace, vuln_ids)
-                    result.blocked.append(pkg_ref)
-                    blocked_details.append({
-                        "package": package_name,
-                        "version": version,
-                        "vuln_ids": vuln_ids,
-                    })
-                    emit_metric("PackagesBlocked", 1)
-                else:
-                    promote_package_version(package_name, version, namespace)
+                action, details, error = future.result()
+                if action == "promoted":
                     result.promoted.append(pkg_ref)
                     emit_metric("PackagesPromoted", 1)
+                elif action == "blocked":
+                    result.blocked.append(pkg_ref)
+                    if details:
+                        blocked_details.append(details)
+                    emit_metric("PackagesBlocked", 1)
+                elif action == "skipped":
+                    result.skipped.append(pkg_ref)
+                elif action == "error":
+                    if error:
+                        result.errors.append(error)
+            except Exception as exc:
+                _log("error", "unhandled_thread_error", package_ref=pkg_ref, error=str(exc))
+                result.errors.append(f"{pkg_ref}: unhandled exception {exc}")
 
-            except ClientError as exc:
-                code = exc.response["Error"]["Code"]
-                if code == "ResourceNotFoundException":
-                    _log("warning", "package_not_found", package_ref=pkg_ref)
-                else:
-                    _log("error", "package_processing_error",
-                         package_ref=pkg_ref, error_code=code, error=str(exc))
-                    result.errors.append(f"{pkg_ref}: {exc}")
-                continue
-
-    # ── 3. Alerta SNS agregado ────────────────────────────────────────────────
     if blocked_details:
         try:
             send_block_alert(blocked_details)
         except ClientError as exc:
             _log("error", "sns_alert_failed", error=str(exc))
 
-    # ── 4. Métricas de execução ───────────────────────────────────────────────
     elapsed_ms = (time.monotonic() - start_time) * 1000
     emit_metric("ExecutionDurationMs", elapsed_ms, unit="Milliseconds")
     emit_metric("ExecutionErrors", len(result.errors))
